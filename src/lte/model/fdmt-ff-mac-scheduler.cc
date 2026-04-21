@@ -39,7 +39,8 @@ NS_OBJECT_ENSURE_REGISTERED(FdMtFfMacScheduler);
 FdMtFfMacScheduler::FdMtFfMacScheduler()
     : m_cschedSapUser(nullptr),
       m_schedSapUser(nullptr),
-      m_nextRntiUl(0)
+      m_nextRntiUl(0),
+      m_bufferAware(false)
 {
     m_amc = CreateObject<LteAmc>();
     m_cschedSapProvider = new MemberCschedSapProvider<FdMtFfMacScheduler>(this);
@@ -88,7 +89,13 @@ FdMtFfMacScheduler::GetTypeId()
                           "The MCS of the UL grant, must be [0..15] (default 0)",
                           UintegerValue(0),
                           MakeUintegerAccessor(&FdMtFfMacScheduler::m_ulGrantMcs),
-                          MakeUintegerChecker<uint8_t>());
+                          MakeUintegerChecker<uint8_t>())
+            .AddAttribute("BufferAware",
+                          "If true, the scheduler will stop assigning resources to a UE if its "
+                          "buffer is already satisfied.",
+                          BooleanValue(false),
+                          MakeBooleanAccessor(&FdMtFfMacScheduler::m_bufferAware),
+                          MakeBooleanChecker());
     return tid;
 }
 
@@ -840,6 +847,20 @@ FdMtFfMacScheduler::DoSchedDlTriggerReq(
         return;
     }
 
+    // Buffer-Aware Tracking ---
+    std::map<uint16_t, uint32_t> rlcBufSize;
+    std::map<uint16_t, uint32_t> allocatedBytesPerUe;
+
+    if (m_bufferAware)
+    {
+        for (auto it = m_rlcBufferReq.begin(); it != m_rlcBufferReq.end(); it++)
+        {
+            rlcBufSize[(*it).first.m_rnti] += (*it).second.m_rlcTransmissionQueueSize +
+                                              (*it).second.m_rlcRetransmissionQueueSize +
+                                              (*it).second.m_rlcStatusPduSize;
+        }
+    }
+
     for (int i = 0; i < rbgNum; i++)
     {
         NS_LOG_INFO(this << " ALLOCATION for RBG " << i << " of " << rbgNum);
@@ -850,6 +871,8 @@ FdMtFfMacScheduler::DoSchedDlTriggerReq(
 
         auto itMax = m_flowStatsDl.end();
         double rcqiMax = 0.0;
+        uint32_t bytesForItMax = 0; // Tracks bytes for the best UE
+
         for (auto it = m_flowStatsDl.begin(); it != m_flowStatsDl.end(); it++)
         {
             auto itRnti = rntiAllocated.find(*it);
@@ -865,6 +888,11 @@ FdMtFfMacScheduler::DoSchedDlTriggerReq(
                     NS_LOG_DEBUG(this << " RNTI discarded for HARQ id" << (uint16_t)(*it));
                 }
                 continue;
+            }
+
+            if (m_bufferAware && allocatedBytesPerUe[*it] >= rlcBufSize[*it])
+            {
+                continue; // Skip this UE, its buffer is already satisfied
             }
 
             auto itCqi = m_a30CqiRxed.find(*it);
@@ -897,6 +925,8 @@ FdMtFfMacScheduler::DoSchedDlTriggerReq(
                     // this UE has data to transmit
                     double achievableRate = 0.0;
                     uint8_t mcs = 0;
+                    uint32_t bytesPerRbg = 0;
+
                     for (uint8_t k = 0; k < nLayer; k++)
                     {
                         if (sbCqi.size() > k)
@@ -908,8 +938,11 @@ FdMtFfMacScheduler::DoSchedDlTriggerReq(
                             // no info on this subband -> worst MCS
                             mcs = 0;
                         }
-                        achievableRate += ((m_amc->GetDlTbSizeFromMcs(mcs, rbgSize) / 8) /
-                                           0.001); // = TB size / TTI
+
+                        // Calculate bytes and update trackers
+                        uint32_t bytes = m_amc->GetDlTbSizeFromMcs(mcs, rbgSize) / 8;
+                        achievableRate += ((bytes) / 0.001); // = TB size / TTI
+                        bytesPerRbg += bytes;
                     }
 
                     double rcqi = achievableRate;
@@ -920,6 +953,7 @@ FdMtFfMacScheduler::DoSchedDlTriggerReq(
                     {
                         rcqiMax = rcqi;
                         itMax = it;
+                        bytesForItMax = bytesPerRbg; // Store bytes for the winning UE
                     }
                 }
             }
@@ -945,6 +979,12 @@ FdMtFfMacScheduler::DoSchedDlTriggerReq(
             {
                 (*itMap).second.push_back(i);
             }
+
+            if (m_bufferAware)
+            {
+                allocatedBytesPerUe[*itMax] += bytesForItMax;
+            }
+
             NS_LOG_INFO(this << " UE assigned " << (*itMax));
         }
     }
@@ -1360,13 +1400,14 @@ FdMtFfMacScheduler::DoSchedUlTriggerReq(
 
     // Divide the remaining resources equally among the active users starting from the subsequent
     // one served last scheduling trigger
-    uint16_t rbPerFlow = (m_cschedCellConfig.m_ulBandwidth) / (nflows + rntiAllocated.size());
-    if (rbPerFlow < 3)
+    uint16_t defaultRbPerFlow =
+        (m_cschedCellConfig.m_ulBandwidth) / (nflows + rntiAllocated.size());
+    if (defaultRbPerFlow < 3)
     {
-        rbPerFlow = 3; // at least 3 rbg per flow (till available resource) to ensure TxOpportunity
-                       // >= 7 bytes
+        defaultRbPerFlow = 3;
     }
     int rbAllocated = 0;
+    uint16_t rbPerFlow = 0;
 
     if (m_nextRntiUl != 0)
     {
@@ -1412,6 +1453,27 @@ FdMtFfMacScheduler::DoSchedUlTriggerReq(
             {
                 // terminate allocation
                 rbPerFlow = 0;
+            }
+        }
+
+        // UL Buffer Awareness ---
+        if (m_bufferAware && rbPerFlow > 3)
+        {
+            uint16_t mcs = 0;
+            auto itCqi = m_ueCqi.find((*it).first);
+            if (itCqi != m_ueCqi.end() && !(*itCqi).second.empty())
+            {
+                double minSinr = (*itCqi).second.at(0);
+                double s =
+                    log2(1 + (std::pow(10, minSinr / 10) / ((-std::log(5.0 * 0.00005)) / 1.5)));
+                mcs = m_amc->GetMcsFromCqi(m_amc->GetCqiFromSpectralEfficiency(s));
+            }
+
+            // Shrink rbPerFlow if it's too large for the buffer (keep minimum 3)
+            while (rbPerFlow > 3 &&
+                   (uint32_t)(m_amc->GetUlTbSizeFromMcs(mcs, rbPerFlow - 1) / 8) >= (*it).second)
+            {
+                rbPerFlow--;
             }
         }
 
