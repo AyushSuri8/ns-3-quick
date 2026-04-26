@@ -1407,7 +1407,7 @@ FdMtFfMacScheduler::DoSchedUlTriggerReq(
         defaultRbPerFlow = 3;
     }
     int rbAllocated = 0;
-    uint16_t rbPerFlow = 0;
+    uint16_t rbPerFlow = defaultRbPerFlow;
 
     if (m_nextRntiUl != 0)
     {

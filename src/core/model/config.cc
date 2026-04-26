@@ -909,33 +909,22 @@ SetDefaultFailSafe(std::string fullName, const AttributeValue& value)
     {
         return false;
     }
-
-    // Climb the inheritance tree to find the attribute
     TypeId::AttributeInformation info;
     tid.LookupAttributeByName(paramName, &info);
-
-    // Climb the inheritance tree to find the attribute
-    TypeId nextTid = tid;
-    do
+    for (uint32_t j = 0; j < tid.GetAttributeN(); j++)
     {
-        tid = nextTid;
-        for (uint32_t j = 0; j < tid.GetAttributeN(); j++)
+        TypeId::AttributeInformation tmp = tid.GetAttribute(j);
+        if (tmp.name == paramName)
         {
-            TypeId::AttributeInformation tmp = tid.GetAttribute(j);
-            if (tmp.name == paramName)
+            Ptr<AttributeValue> v = tmp.checker->CreateValidValue(value);
+            if (!v)
             {
-                Ptr<AttributeValue> v = tmp.checker->CreateValidValue(value);
-                if (!v)
-                {
-                    return false;
-                }
-                tid.SetAttributeInitialValue(j, v);
-                return true;
+                return false;
             }
+            tid.SetAttributeInitialValue(j, v);
+            return true;
         }
-        nextTid = tid.GetParent();
-    } while (nextTid != tid); // Stop when we reach the top of the inheritance tree
-
+    }
     return false;
 }
 

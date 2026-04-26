@@ -1314,7 +1314,7 @@ RrFfMacScheduler::DoSchedUlTriggerReq(
             3; // at least 3 rbg per flow (till available resource) to ensure TxOpportunity
     }
     uint16_t rbAllocated = 0;
-    uint16_t rbPerFlow = 0;
+    uint16_t rbPerFlow = defaultRbPerFlow;
 
     if (m_nextRntiUl != 0)
     {
